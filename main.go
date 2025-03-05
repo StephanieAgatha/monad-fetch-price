@@ -20,15 +20,15 @@ const (
 	DAK_ADDRESS  = "0x0F0BDEbF0F83cD1EE3974779Bcb7315f9808c714"
 	LBTC_ADDRESS = "0x73a58b73018c1a417534232529b57b99132b13D2"
 	USDC_ADDRESS = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea"
-	USDT_ADDRESS = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea" //cause route not found,we will use same price with usdc
+	USDT_ADDRESS = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea"
 	WETH_ADDRESS = "0xB5a30b0FDc5EA94A52fDc42e3E9760Cb8449Fb37"
 	WBTC_ADDRESS = "0xcf5a6076cfa32686c0Df13aBaDa2b40dec133F1d"
-	CACHE_TTL    = 2 * time.Hour
+	CACHE_TTL    = 5 * time.Minute
 )
 
 var tokenAddresses = map[string]string{
 	"mon":  MON_ADDRESS,
-	"wmon": MON_ADDRESS, //we will use same as mon token
+	"wmon": MON_ADDRESS,
 	"dak":  DAK_ADDRESS,
 	"lbtc": LBTC_ADDRESS,
 	"usdc": USDC_ADDRESS,
@@ -111,59 +111,92 @@ func (c *TokenPairCache) Set(inputToken, outputToken, amount string, result Resu
 var cache = NewTokenPairCache()
 
 func fetchTokenPrice(inputToken, outputToken, amount, targetURL string) (Result, error) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-	)
+	const maxRetries = 3
+	var inputAmount, outputAmount float64
+	var err error
 
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Attempt %d of %d for %s to %s (amount: %s)", attempt, maxRetries, inputToken, outputToken, amount)
 
-	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
-	defer cancel()
+		opts := append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+		)
 
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+		allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+		ctx, cancel2 := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
+		ctx, cancel3 := context.WithTimeout(ctx, 30*time.Second)
 
-	var inputValue, outputValue string
+		var inputValue, outputValue string
 
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(targetURL),
-		chromedp.WaitVisible(`input[data-sentry-element="Input"]`, chromedp.ByQuery),
-		chromedp.Clear(`input[data-sentry-element="Input"]`, chromedp.ByQuery),
-		chromedp.SendKeys(`input[data-sentry-element="Input"]`, amount, chromedp.ByQuery),
-		chromedp.Sleep(5*time.Second),
-		chromedp.Value(`input[data-sentry-element="Input"]`, &inputValue, chromedp.ByQuery),
-		chromedp.Evaluate(`Array.from(document.querySelectorAll('input[data-sentry-element="Input"]')).filter(el => el.placeholder === "0.00")[1]?.value || "0"`, &outputValue),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			if outputValue == "0" || outputValue == "" {
-				var result string
-				err := chromedp.Evaluate(`document.querySelector('div[data-sentry-component="SwapInput"]:nth-of-type(2) input[data-sentry-element="Input"]').value`, &result).Do(ctx)
-				if err == nil && result != "" {
-					outputValue = result
+		err = chromedp.Run(ctx,
+			chromedp.Navigate(targetURL),
+			chromedp.WaitVisible(`input[data-sentry-element="Input"]`, chromedp.ByQuery),
+			chromedp.Clear(`input[data-sentry-element="Input"]`, chromedp.ByQuery),
+			chromedp.SendKeys(`input[data-sentry-element="Input"]`, amount, chromedp.ByQuery),
+			chromedp.Sleep(5*time.Second),
+			chromedp.Value(`input[data-sentry-element="Input"]`, &inputValue, chromedp.ByQuery),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('input[data-sentry-element="Input"]')).filter(el => el.placeholder === "0.00")[1]?.value || "0"`, &outputValue),
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				if outputValue == "0" || outputValue == "" {
+					var result string
+					err := chromedp.Evaluate(`document.querySelector('div[data-sentry-component="SwapInput"]:nth-of-type(2) input[data-sentry-element="Input"]').value`, &result).Do(ctx)
+					if err == nil && result != "" {
+						outputValue = result
+					}
 				}
+				return nil
+			}),
+		)
+
+		cancel3()
+		cancel2()
+		cancel()
+
+		if err != nil {
+			log.Printf("Error in attempt %d: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+				continue
 			}
-			return nil
-		}),
-	)
+			return Result{}, err
+		}
 
-	if err != nil {
-		return Result{}, err
-	}
+		inputValue = strings.TrimSpace(inputValue)
+		outputValue = strings.TrimSpace(outputValue)
 
-	inputValue = strings.TrimSpace(inputValue)
-	outputValue = strings.TrimSpace(outputValue)
+		inputAmount, err = strconv.ParseFloat(inputValue, 64)
+		if err != nil {
+			log.Printf("Error parsing input value in attempt %d: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return Result{}, err
+		}
 
-	inputAmount, err := strconv.ParseFloat(inputValue, 64)
-	if err != nil {
-		return Result{}, err
-	}
-
-	outputAmount, err := strconv.ParseFloat(outputValue, 64)
-	if err != nil {
-		return Result{}, err
+		outputAmount, err = strconv.ParseFloat(outputValue, 64)
+		if err != nil {
+			log.Printf("Error parsing output value in attempt %d: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return Result{}, err
+		}
+		if (inputAmount == outputAmount && inputToken != outputToken) || outputAmount == 0 {
+			log.Printf("Invalid result detected in attempt %d. Input: %f, Output: %f",
+				attempt, inputAmount, outputAmount)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return Result{}, fmt.Errorf("invalid conversion result: same input/output amount or zero output")
+		}
+		//valid result
+		break
 	}
 
 	var decimalPlaces int
@@ -237,16 +270,29 @@ func handleTokenPrice(c *gin.Context) {
 	}
 
 	if cachedResult, found := cache.Get(inputToken, outputToken, amount); found {
-		duration := time.Since(startTime)
-		log.Printf("[CACHE HIT] Request processed in %v", duration)
-		c.JSON(http.StatusOK, cachedResult)
-		return
+		if (cachedResult.Input.Amount == cachedResult.Output.Amount &&
+			cachedResult.Input.Token != cachedResult.Output.Token) ||
+			cachedResult.Output.Amount == 0 {
+			log.Printf("[CACHE INVALID] Invalid cached result detected, fetching fresh data")
+		} else {
+			duration := time.Since(startTime)
+			log.Printf("[CACHE HIT] Request processed in %v", duration)
+			c.JSON(http.StatusOK, cachedResult)
+			return
+		}
 	}
 
 	targetURL := fmt.Sprintf("https://kuru.io/swap?from=%s&to=%s", fromAddress, toAddress)
 	result, err := fetchTokenPrice(inputToken, outputToken, amount, targetURL)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if (result.Input.Amount == result.Output.Amount &&
+		result.Input.Token != result.Output.Token) ||
+		result.Output.Amount == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid conversion result: same input/output amount or zero output"})
 		return
 	}
 
